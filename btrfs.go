@@ -311,7 +311,7 @@ func SubvolSnapshot(dst, src string, readonly bool) error {
 }
 
 // SubvolDelete deletes the subvolumes under the given path.
-func SubvolDelete(path string) error {
+func SubvolDelete(path string, waitForCommit bool) error {
 	dir, name := filepath.Split(path)
 	fp, err := openSubvolDir(dir)
 	if err != nil {
@@ -341,7 +341,7 @@ func SubvolDelete(path string) error {
 			return nil
 		}
 
-		if err := SubvolDelete(p); err != nil {
+		if err := SubvolDelete(p, waitForCommit); err != nil {
 			return errors.Wrapf(err, "recursive delete of %v failed", p)
 		}
 
@@ -360,6 +360,16 @@ func SubvolDelete(path string) error {
 
 	if err := ioctl(fp.Fd(), C.BTRFS_IOC_SNAP_DESTROY, uintptr(unsafe.Pointer(&args))); err != nil {
 		return errors.Wrapf(err, "failed removing subvolume %v", path)
+	}
+
+	if waitForCommit {
+		if err := ioctl(fp.Fd(), C.BTRFS_IOC_START_SYNC, uintptr(0)); err != nil {
+			return errors.Wrapf(err, "failed sync start subvolume removing %q", path)
+		}
+
+		if err := ioctl(fp.Fd(), C.BTRFS_IOC_WAIT_SYNC, uintptr(0)); err != nil {
+			return errors.Wrapf(err, "failed sync wait subvolume removing (wait) %q", path)
+		}
 	}
 
 	return nil
