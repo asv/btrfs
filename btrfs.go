@@ -1,7 +1,5 @@
 package btrfs
 
-import "sort"
-
 /*
 #include <stddef.h>
 #include <btrfs/ioctl.h>
@@ -18,12 +16,16 @@ static char* get_name_btrfs_ioctl_vol_args_v2(struct btrfs_ioctl_vol_args_v2* bt
 import "C"
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 )
 
 // IsSubvolume returns nil if the path is a valid subvolume. An error is
@@ -85,6 +87,43 @@ func SubvolInfo(path string) (info Info, err error) {
 	}
 
 	return info, errors.Errorf("%q not found", path)
+}
+
+func isSubvolCleaned(fd uintptr, subvolID uint64) (bool, error) {
+	var args C.struct_btrfs_ioctl_search_args
+
+	args.key.tree_id = C.BTRFS_ROOT_TREE_OBJECTID
+	args.key.min_objectid = C.__u64(subvolID)
+	args.key.max_objectid = C.__u64(subvolID)
+	args.key.min_type = C.BTRFS_ROOT_ITEM_KEY
+	args.key.max_type = C.BTRFS_ROOT_ITEM_KEY
+	args.key.min_offset = 0
+	args.key.max_offset = C.negative_one
+	args.key.min_transid = 0
+	args.key.max_transid = C.negative_one
+	args.key.nr_items = 1
+
+	if err := ioctl(fd, C.BTRFS_IOC_TREE_SEARCH, uintptr(unsafe.Pointer(&args))); err != nil {
+		return false, err
+	}
+
+	fmt.Printf("args.keys.nr_items=%d\n", args.key.nr_items)
+	return args.key.nr_items == 0, nil
+}
+
+func waitSubvolCleaning(fd uintptr, subvolID uint64) error {
+	for {
+		ok, err := isSubvolCleaned(fd, subvolID)
+		if err != nil {
+			return errors.Wrapf(err, "can't read status of dead subvolume %d", subvolID)
+		}
+
+		if ok {
+			return nil
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func subvolMap(path string) (map[uint64]*Info, error) {
@@ -310,6 +349,21 @@ func SubvolSnapshot(dst, src string, readonly bool) error {
 	return nil
 }
 
+func subvolRescanQuota(path string) error {
+	fp, err := openSubvolDir(path)
+	if err != nil {
+		return errors.Wrapf(err, "failed opening %q", path)
+	}
+	defer fp.Close()
+
+	var args C.struct_btrfs_ioctl_quota_rescan_args
+	if err := ioctl(fp.Fd(), C.BTRFS_IOC_QUOTA_RESCAN_WAIT, uintptr(unsafe.Pointer(&args))); err != nil {
+		return errors.Wrapf(err, "failed to rescan BTRFS quota for %q", path)
+	}
+
+	return nil
+}
+
 // SubvolDelete deletes the subvolumes under the given path.
 func SubvolDelete(path string, waitForCommit bool) error {
 	dir, name := filepath.Split(path)
@@ -318,6 +372,11 @@ func SubvolDelete(path string, waitForCommit bool) error {
 		return errors.Wrapf(err, "failed opening %v", path)
 	}
 	defer fp.Close()
+
+	id, err := SubvolID(path)
+	if err != nil {
+		return errors.Wrap(err, "failed getting subvolid")
+	}
 
 	// remove child subvolumes
 	if err := filepath.Walk(path, func(p string, fi os.FileInfo, err error) error {
@@ -372,6 +431,14 @@ func SubvolDelete(path string, waitForCommit bool) error {
 		}
 	}
 
+	if err := waitSubvolCleaning(fp.Fd(), id); err != nil {
+		return errors.Wrap(err, "failed wait for cleaning")
+	}
+
+	if err := unix.Syncfs(int(fp.Fd())); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -394,7 +461,7 @@ func isStatfsSubvol(statfs *syscall.Statfs_t) error {
 
 func isFileInfoSubvol(fi os.FileInfo) error {
 	if !fi.IsDir() {
-		errors.Errorf("must be a directory")
+		return errors.Errorf("must be a directory")
 	}
 
 	stat := fi.Sys().(*syscall.Stat_t)
